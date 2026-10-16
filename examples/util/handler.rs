@@ -12,13 +12,19 @@ pub struct ExampleHandler {
 }
 
 #[cfg(all(feature = "x11rb-client", not(feature = "xlib-client")))]
-trait ClientAlias = Client<XEvent = x11rb::protocol::xproto::KeyPressEvent>;
+trait ClientAlias: Client<XEvent = x11rb::protocol::xproto::KeyPressEvent> {}
+#[cfg(all(feature = "x11rb-client", not(feature = "xlib-client")))]
+impl<T: Client<XEvent = x11rb::protocol::xproto::KeyPressEvent>> ClientAlias for T {}
 
 #[cfg(all(feature = "xlib-client", not(feature = "x11rb-client")))]
-trait ClientAlias = Client<XEvent = x11_dl::xlib::XKeyPressedEvent>;
+trait ClientAlias: Client<XEvent = x11_dl::xlib::XKeyPressedEvent> {}
+#[cfg(all(feature = "xlib-client", not(feature = "x11rb-client")))]
+impl<T: Client<XEvent = x11_dl::xlib::XKeyPressedEvent>> ClientAlias for T {}
 
 #[cfg(all(feature = "xlib-client", feature = "x11rb-client"))]
-trait ClientAlias = Client;
+trait ClientAlias: Client {}
+#[cfg(all(feature = "xlib-client", feature = "x11rb-client"))]
+impl<T: Client> ClientAlias for T {}
 
 impl<C: ClientAlias> ClientHandler<C> for ExampleHandler {
     fn handle_connect(&mut self, client: &mut C) -> Result<(), ClientError> {

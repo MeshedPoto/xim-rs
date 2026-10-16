@@ -1,3 +1,4 @@
+extern crate zed_xim as xim;
 use x11rb::connection::Connection;
 use xim::{
     x11rb::X11rbServer, Server, ServerError, ServerHandler, UserInputContext, XimConnections,

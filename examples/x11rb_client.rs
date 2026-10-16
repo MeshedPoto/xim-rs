@@ -1,4 +1,4 @@
-#![feature(trait_alias)]
+extern crate zed_xim as xim;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::{xproto::*, Event};

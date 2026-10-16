@@ -17,7 +17,6 @@ use crate::client::{
 };
 #[cfg(feature = "x11rb-server")]
 use crate::server::{ServerCore, ServerError, ServerHandler, XimConnection, XimConnections};
-#[cfg(feature = "x11rb-client")]
 use crate::AHashMap;
 #[cfg(feature = "x11rb-client")]
 use xim_parser::{Attr, AttributeName};
@@ -154,6 +153,7 @@ pub struct X11rbServer<C: HasConnection> {
     atoms: Atoms<Atom>,
     buf: Vec<u8>,
     sequence: u16,
+    property_offsets: PropertyOffsets,
 }
 
 #[cfg(feature = "x11rb-server")]
@@ -237,6 +237,7 @@ impl<C: HasConnection> X11rbServer<C> {
             atoms,
             buf: Vec::with_capacity(1024),
             sequence: 0,
+            property_offsets: PropertyOffsets::with_hasher(Default::default()),
         })
     }
 
@@ -295,6 +296,8 @@ impl<C: HasConnection> X11rbServer<C> {
                         self.handle_xim_protocol(msg, connection, handler)?;
                         if connection.disconnected {
                             connections.remove_connection(msg.window);
+                            self.property_offsets
+                                .retain(|(window, _), _| *window != msg.window);
                         }
                     } else {
                         log::warn!("Unknown connection");
@@ -314,12 +317,8 @@ impl<C: HasConnection> X11rbServer<C> {
         handler: &mut impl ServerHandler<Self, InputContextData = T>,
     ) -> Result<(), ServerError> {
         if msg.format == 32 {
-            let [length, atom, ..] = msg.data.as_data32();
-            let data = self
-                .conn()
-                .get_property(true, msg.window, atom, AtomEnum::ANY, 0, length)?
-                .reply()?
-                .value;
+            let data = read_xim_property(&self.has_conn, &mut self.property_offsets, msg)?
+                .ok_or(ServerError::InvalidReply)?;
             let req = xim_parser::read(&data)?;
             connection.handle_request(self, req, handler)
         } else {
@@ -369,6 +368,7 @@ impl<C: HasConnection> ServerCore for X11rbServer<C> {
             client_win,
             &mut self.buf,
             &mut self.sequence,
+            PropertyAtoms::LegacyServer,
             20,
             &req,
         )
@@ -392,6 +392,7 @@ pub struct X11rbClient<C: HasConnection> {
     im_attributes: AHashMap<AttributeName, u16>,
     ic_attributes: AHashMap<AttributeName, u16>,
     sequence: u16,
+    property_offsets: PropertyOffsets,
     buf: Vec<u8>,
 }
 
@@ -475,6 +476,7 @@ impl<C: HasConnection> X11rbClient<C> {
                             transport_max: 20,
                             client_window,
                             sequence: 0,
+                            property_offsets: PropertyOffsets::with_hasher(Default::default()),
                             buf: Vec::with_capacity(1024),
                         });
                     }
@@ -583,21 +585,19 @@ impl<C: HasConnection> X11rbClient<C> {
         handler: &mut impl ClientHandler<Self>,
     ) -> Result<(), ClientError> {
         if msg.format == 32 {
-            let [length, atom, ..] = msg.data.as_data32();
-            let reply = self
-                .conn()
-                .get_property(true, msg.window, atom, AtomEnum::ANY, 0, length)?
-                .reply()?;
-            // handle fcitx4 occasionally sending empty reply
-            if reply.value_len == 0 {
-                return Err(ClientError::InvalidReply);
-            }
-            let data = reply.value;
+            let data = read_xim_property(&self.has_conn, &mut self.property_offsets, msg)?
+                .ok_or(ClientError::InvalidReply)?;
             let req = xim_parser::read(&data)?;
+            if matches!(&req, Request::DisconnectReply {}) {
+                self.property_offsets.clear();
+            }
             client_handle_request(self, handler, req)?;
         } else if msg.format == 8 {
             let data = msg.data.as_data8();
             let req: xim_parser::Request = xim_parser::read(&data)?;
+            if matches!(&req, Request::DisconnectReply {}) {
+                self.property_offsets.clear();
+            }
             client_handle_request(self, handler, req)?;
         }
 
@@ -680,10 +680,65 @@ impl<C: HasConnection> ClientCore for X11rbClient<C> {
             self.im_window,
             &mut self.buf,
             &mut self.sequence,
+            PropertyAtoms::BoundedClient,
             self.transport_max,
             &req,
         )
     }
+}
+
+// Atom names live for the lifetime of the X server. Reuse a small, global
+// namespace rather than allocating one name per packet or per connection.
+const PROPERTY_ATOM_COUNT: u16 = 32;
+
+// Keep legacy server allocation until all supported client transports can
+// consume several packets appended to a reused property (including xlib).
+#[derive(Clone, Copy)]
+enum PropertyAtoms {
+    BoundedClient,
+    LegacyServer,
+}
+type PropertyOffsets = AHashMap<(Window, Atom), u32>;
+
+// APPEND may place several outstanding packets in one property. Consume only
+// the packet named by this ClientMessage, preserving ordering with inline CMs.
+// X deletes the property atomically only when this read reaches its end.
+fn read_xim_property<C: HasConnection>(
+    c: &C,
+    offsets: &mut PropertyOffsets,
+    msg: &ClientMessageEvent,
+) -> Result<Option<Vec<u8>>, ReplyError> {
+    let [length, atom, ..] = msg.data.as_data32();
+    // XIM packets have a four-byte header and a body measured in four-byte units.
+    if length < 4 || length % 4 != 0 || length > 4 + u16::MAX as u32 * 4 {
+        return Ok(None);
+    }
+    let key = (msg.window, atom);
+    let offset = offsets.get(&key).copied().unwrap_or(0);
+    let end = match offset.checked_add(length) {
+        Some(end) => end,
+        None => return Ok(None),
+    };
+    let reply = c
+        .conn()
+        .get_property(
+            true,
+            msg.window,
+            atom,
+            AtomEnum::ANY,
+            offset / 4,
+            length / 4,
+        )?
+        .reply()?;
+    if reply.bytes_after == 0 {
+        offsets.remove(&key);
+    } else {
+        offsets.insert(key, end);
+    }
+    if reply.format != 8 || reply.value.len() != length as usize {
+        return Ok(None);
+    }
+    Ok(Some(reply.value))
 }
 
 fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
@@ -692,6 +747,7 @@ fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
     target: Window,
     buf: &mut Vec<u8>,
     sequence: &mut u16,
+    property_atoms: PropertyAtoms,
     transport_max: usize,
     req: &Request,
 ) -> Result<(), E> {
@@ -728,7 +784,10 @@ fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
             .intern_atom(false, format!("_XIM_DATA_{}", sequence).as_bytes())?
             .reply()?
             .atom;
-        *sequence = sequence.wrapping_add(1);
+        *sequence = match property_atoms {
+            PropertyAtoms::BoundedClient => (*sequence + 1) % PROPERTY_ATOM_COUNT,
+            PropertyAtoms::LegacyServer => sequence.wrapping_add(1),
+        };
         c.conn().change_property(
             PropMode::APPEND,
             target,
@@ -773,5 +832,221 @@ fn deserialize_event_impl(xev: &xim_parser::XEvent) -> KeyPressEvent {
         event_y: xev.event_y,
         state: xev.state.into(),
         same_screen: xev.same_screen,
+    }
+}
+
+#[cfg(test)]
+mod property_transport_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+
+    struct TestDisplay(Child);
+    impl Drop for TestDisplay {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Never connects to DISPLAY. Xvfb chooses a free, private display, and this
+    // guard owns and terminates only the server created by this test.
+    fn private_display() -> (TestDisplay, String) {
+        let binary = std::env::var_os("XIM_TEST_XVFB").unwrap_or_else(|| "Xvfb".into());
+        let mut child = Command::new(binary)
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "640x480x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("install Xvfb or set XIM_TEST_XVFB to run isolated transport tests");
+        let stdout = child.stdout.take().unwrap();
+        let guard = TestDisplay(child);
+        let mut number = String::new();
+        BufReader::new(stdout).read_line(&mut number).unwrap();
+        let number: u32 = number
+            .trim()
+            .parse()
+            .expect("Xvfb did not report a display");
+        (guard, format!(":{}", number))
+    }
+
+    fn window(conn: &RustConnection, screen: usize) -> Window {
+        let id = conn.generate_id().unwrap();
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            id,
+            conn.setup().roots[screen].root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &Default::default(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn bounded_atoms_preserve_queued_packets_and_inline_order() {
+        let (_display, address) = private_display();
+        let (receiver, screen) = x11rb::connect(Some(&address)).unwrap();
+        let windows = [window(&receiver, screen), window(&receiver, screen)];
+        let mut offsets = PropertyOffsets::with_hasher(Default::default());
+        let mut all_atoms = HashSet::new();
+        // Reconnect the sender and reuse the same names/windows. Each round
+        // queues far more than the pool size before the receiver reads anything.
+        for round in 0..3 {
+            let (sender, _) = x11rb::connect(Some(&address)).unwrap();
+            let atoms = Atoms::new::<ReplyError, _>(|name| {
+                Ok(sender.intern_atom(false, name.as_bytes())?.reply()?.atom)
+            })
+            .unwrap();
+            let mut sequence = 0;
+            let mut buf = Vec::new();
+            let mut expected = Vec::new();
+            for i in 0..2048 {
+                let req = Request::Open {
+                    locale: if i % 7 == 0 {
+                        "en".into()
+                    } else {
+                        format!("中文输入保持完整-{}-{}-{}", round, i, "x".repeat(i % 31))
+                    },
+                };
+                let mut bytes = alloc::vec![0; req.size()];
+                xim_parser::write(&req, &mut bytes);
+                let target = windows[i % windows.len()];
+                send_req_impl::<_, ReplyError>(
+                    &sender,
+                    &atoms,
+                    target,
+                    &mut buf,
+                    &mut sequence,
+                    PropertyAtoms::BoundedClient,
+                    20,
+                    &req,
+                )
+                .unwrap();
+                expected.push((target, bytes));
+            }
+            // Server-side barrier: every append/event has been processed before
+            // we drain, so the test cannot accidentally avoid pool collisions.
+            sender.get_input_focus().unwrap().reply().unwrap();
+            for (target, bytes) in expected {
+                let msg = loop {
+                    if let Event::ClientMessage(msg) = receiver.wait_for_event().unwrap() {
+                        break msg;
+                    }
+                };
+                assert_eq!(msg.window, target);
+                let actual = if msg.format == 32 {
+                    all_atoms.insert(msg.data.as_data32()[1]);
+                    read_xim_property(&receiver, &mut offsets, &msg)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    msg.data.as_data8()[..bytes.len()].to_vec()
+                };
+                assert_eq!(
+                    actual, bytes,
+                    "queued XIM packet changed or arrived out of order"
+                );
+                xim_parser::read::<Request>(&actual).unwrap();
+            }
+            assert!(
+                offsets.is_empty(),
+                "fully drained properties must reset offsets"
+            );
+            assert!(all_atoms.len() <= PROPERTY_ATOM_COUNT as usize);
+            for target in windows {
+                for atom in &all_atoms {
+                    let reply = receiver
+                        .get_property(false, target, *atom, AtomEnum::ANY, 0, 1)
+                        .unwrap()
+                        .reply()
+                        .unwrap();
+                    assert_eq!(reply.type_, x11rb::NONE, "drained property was not deleted");
+                }
+            }
+        }
+        assert_eq!(all_atoms.len(), PROPERTY_ATOM_COUNT as usize);
+    }
+
+    #[test]
+    fn property_reads_reject_bad_lengths_and_preserve_pending_data() {
+        let (_display, address) = private_display();
+        let (conn, screen) = x11rb::connect(Some(&address)).unwrap();
+        let target = window(&conn, screen);
+        let atom = conn
+            .intern_atom(false, b"_XIM_DATA_0")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let mut offsets = PropertyOffsets::with_hasher(Default::default());
+        let message = |length| ClientMessageEvent::new(32, target, atom, [length, atom, 0, 0, 0]);
+        conn.change_property8(PropMode::APPEND, target, atom, AtomEnum::STRING, &[1; 8])
+            .unwrap();
+        for length in [0, 3, 5, u32::MAX] {
+            assert!(read_xim_property(&conn, &mut offsets, &message(length))
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            read_xim_property(&conn, &mut offsets, &message(4))
+                .unwrap()
+                .unwrap(),
+            [1; 4]
+        );
+        assert_eq!(offsets.get(&(target, atom)), Some(&4));
+        // Append while an earlier frame remains unconsumed.
+        conn.change_property8(PropMode::APPEND, target, atom, AtomEnum::STRING, &[2; 4])
+            .unwrap();
+        assert_eq!(
+            read_xim_property(&conn, &mut offsets, &message(4))
+                .unwrap()
+                .unwrap(),
+            [1; 4]
+        );
+        assert_eq!(
+            read_xim_property(&conn, &mut offsets, &message(4))
+                .unwrap()
+                .unwrap(),
+            [2; 4]
+        );
+        assert!(offsets.is_empty());
+        conn.change_property8(PropMode::APPEND, target, atom, AtomEnum::STRING, &[3; 4])
+            .unwrap();
+        assert_eq!(
+            read_xim_property(&conn, &mut offsets, &message(4))
+                .unwrap()
+                .unwrap(),
+            [3; 4]
+        );
+        assert!(read_xim_property(&conn, &mut offsets, &message(4))
+            .unwrap()
+            .is_none());
+        conn.change_property8(PropMode::APPEND, target, atom, AtomEnum::STRING, &[4; 4])
+            .unwrap();
+        assert!(read_xim_property(&conn, &mut offsets, &message(8))
+            .unwrap()
+            .is_none());
+        conn.change_property32(PropMode::REPLACE, target, atom, AtomEnum::CARDINAL, &[1])
+            .unwrap();
+        assert!(read_xim_property(&conn, &mut offsets, &message(4))
+            .unwrap()
+            .is_none());
     }
 }
