@@ -20,6 +20,8 @@ pub enum ClientError {
     UnsupportedTransport,
     InvalidReply,
     NoXimServer,
+    /// The server has not consumed earlier packets and the send queue is full.
+    TransportBusy,
     #[cfg(feature = "std")]
     Other(alloc::boxed::Box<dyn std::error::Error + Send + Sync>),
 }
@@ -40,6 +42,7 @@ impl fmt::Display for ClientError {
             ClientError::UnsupportedTransport => write!(f, "Server Transport is not supported"),
             ClientError::InvalidReply => write!(f, "Invalid reply from server"),
             ClientError::NoXimServer => write!(f, "Can't connect xim server"),
+            ClientError::TransportBusy => write!(f, "Xim server is not consuming requests"),
             #[cfg(feature = "std")]
             ClientError::Other(e) => write!(f, "Other error: {}", e),
         }

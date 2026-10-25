@@ -5,10 +5,12 @@
 //!
 //! [`x11rb`]: https://crates.io/crates/x11rb
 
+#[cfg(feature = "x11rb-client")]
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::{convert::TryInto, rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc};
 use x11rb::protocol::xproto::EventMask;
 
 #[cfg(feature = "x11rb-client")]
@@ -32,11 +34,11 @@ use x11rb::{
     errors::{ConnectError, ConnectionError, ParseError, ReplyError, ReplyOrIdError},
     protocol::{
         xproto::{
-            Atom, AtomEnum, ClientMessageEvent, ConnectionExt, KeyPressEvent, PropMode, Screen,
-            SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass, CLIENT_MESSAGE_EVENT,
-            SELECTION_NOTIFY_EVENT,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt,
+            KeyPressEvent, PropMode, Property, Screen, SelectionNotifyEvent, SelectionRequestEvent,
+            Window, WindowClass, CLIENT_MESSAGE_EVENT, SELECTION_NOTIFY_EVENT,
         },
-        Event,
+        ErrorKind, Event,
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
@@ -368,7 +370,6 @@ impl<C: HasConnection> ServerCore for X11rbServer<C> {
             client_win,
             &mut self.buf,
             &mut self.sequence,
-            PropertyAtoms::LegacyServer,
             20,
             &req,
         )
@@ -391,9 +392,8 @@ pub struct X11rbClient<C: HasConnection> {
     client_window: u32,
     im_attributes: AHashMap<AttributeName, u16>,
     ic_attributes: AHashMap<AttributeName, u16>,
-    sequence: u16,
+    transport: PropertyTransport,
     property_offsets: PropertyOffsets,
-    buf: Vec<u8>,
 }
 
 #[cfg(feature = "x11rb-client")]
@@ -475,9 +475,8 @@ impl<C: HasConnection> X11rbClient<C> {
                             im_window: x11rb::NONE,
                             transport_max: 20,
                             client_window,
-                            sequence: 0,
+                            transport: PropertyTransport::new(),
                             property_offsets: PropertyOffsets::with_hasher(Default::default()),
-                            buf: Vec::with_capacity(1024),
                         });
                     }
                 }
@@ -543,6 +542,13 @@ impl<C: HasConnection> X11rbClient<C> {
                     Ok(false)
                 }
             }
+            Event::PropertyNotify(e) if e.window == self.im_window => {
+                if e.state == Property::DELETE {
+                    self.transport
+                        .flush(&self.has_conn, &self.atoms, self.transport_max)?;
+                }
+                Ok(true)
+            }
             Event::ClientMessage(msg) if msg.window == self.client_window => {
                 if msg.type_ == self.atoms.XIM_XCONNECT {
                     let [im_window, major, minor, max, _] = msg.data.as_data32();
@@ -555,6 +561,7 @@ impl<C: HasConnection> X11rbClient<C> {
                     );
                     self.im_window = im_window;
                     self.transport_max = max as usize;
+                    self.transport.connect(&self.has_conn, im_window)?;
                     self.send_req(Request::Connect {
                         client_major_protocol_version: 1,
                         client_minor_protocol_version: 0,
@@ -590,6 +597,7 @@ impl<C: HasConnection> X11rbClient<C> {
             let req = xim_parser::read(&data)?;
             if matches!(&req, Request::DisconnectReply {}) {
                 self.property_offsets.clear();
+                self.transport.disconnect();
             }
             client_handle_request(self, handler, req)?;
         } else if msg.format == 8 {
@@ -597,6 +605,7 @@ impl<C: HasConnection> X11rbClient<C> {
             let req: xim_parser::Request = xim_parser::read(&data)?;
             if matches!(&req, Request::DisconnectReply {}) {
                 self.property_offsets.clear();
+                self.transport.disconnect();
             }
             client_handle_request(self, handler, req)?;
         }
@@ -674,31 +683,148 @@ impl<C: HasConnection> ClientCore for X11rbClient<C> {
 
     #[inline]
     fn send_req(&mut self, req: Request) -> Result<(), ClientError> {
-        send_req_impl(
-            &self.has_conn,
-            &self.atoms,
-            self.im_window,
-            &mut self.buf,
-            &mut self.sequence,
-            PropertyAtoms::BoundedClient,
-            self.transport_max,
-            &req,
-        )
+        log_req(&req);
+        let mut packet = alloc::vec![0; req.size()];
+        xim_parser::write(&req, &mut packet);
+        self.transport
+            .send(&self.has_conn, &self.atoms, self.transport_max, packet)
     }
 }
 
 // Atom names live for the lifetime of the X server. Reuse a small, global
 // namespace rather than allocating one name per packet or per connection.
-const PROPERTY_ATOM_COUNT: u16 = 32;
+#[cfg(feature = "x11rb-client")]
+const PROPERTY_ATOM_COUNT: usize = 32;
+// Packets wait here while every property still holds an unread packet. A
+// server that stops deleting properties gets an error instead of unbounded memory.
+#[cfg(feature = "x11rb-client")]
+const MAX_QUEUED_PACKETS: usize = 1024;
 
-// Keep legacy server allocation until all supported client transports can
-// consume several packets appended to a reused property (including xlib).
-#[derive(Clone, Copy)]
-enum PropertyAtoms {
-    BoundedClient,
-    LegacyServer,
-}
 type PropertyOffsets = AHashMap<(Window, Atom), u32>;
+
+// Receivers before this fork (and xlib-style receivers) read every property from
+// offset zero and delete it, so a property must never hold more than one packet.
+// Reuse a name only after the receiver deleted it; until then queue every packet,
+// inline ones included, so ClientMessage order is unchanged.
+#[cfg(feature = "x11rb-client")]
+struct PropertyTransport {
+    target: Window,
+    slots: Vec<Atom>,
+    next: usize,
+    queue: VecDeque<Vec<u8>>,
+}
+
+#[cfg(feature = "x11rb-client")]
+impl PropertyTransport {
+    fn new() -> Self {
+        Self {
+            target: x11rb::NONE,
+            slots: Vec::new(),
+            next: 0,
+            queue: VecDeque::new(),
+        }
+    }
+
+    // Deletions by the receiver arrive as PropertyNotify events on its window.
+    fn connect<C: HasConnection>(&mut self, c: &C, target: Window) -> Result<(), ClientError> {
+        self.target = target;
+        self.next = 0;
+        self.queue.clear();
+        c.conn().change_window_attributes(
+            target,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?;
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        self.target = x11rb::NONE;
+        self.queue.clear();
+    }
+
+    fn send<C: HasConnection>(
+        &mut self,
+        c: &C,
+        atoms: &Atoms<Atom>,
+        transport_max: usize,
+        packet: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.flush(c, atoms, transport_max)?;
+        if self.queue.is_empty() && self.try_send(c, atoms, transport_max, &packet)? {
+            c.conn().flush()?;
+            return Ok(());
+        }
+        if self.queue.len() >= MAX_QUEUED_PACKETS {
+            return Err(ClientError::TransportBusy);
+        }
+        self.queue.push_back(packet);
+        Ok(())
+    }
+
+    fn flush<C: HasConnection>(
+        &mut self,
+        c: &C,
+        atoms: &Atoms<Atom>,
+        transport_max: usize,
+    ) -> Result<(), ClientError> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        while let Some(packet) = self.queue.pop_front() {
+            if !self.try_send(c, atoms, transport_max, &packet)? {
+                self.queue.push_front(packet);
+                break;
+            }
+        }
+        c.conn().flush()?;
+        Ok(())
+    }
+
+    // Returns false while the next property still holds an unread packet.
+    fn try_send<C: HasConnection>(
+        &mut self,
+        c: &C,
+        atoms: &Atoms<Atom>,
+        transport_max: usize,
+        packet: &[u8],
+    ) -> Result<bool, ClientError> {
+        if packet.len() < transport_max {
+            send_inline::<_, ClientError>(c, atoms, self.target, packet)?;
+            return Ok(true);
+        }
+        if self.slots.is_empty() {
+            let cookies = (0..PROPERTY_ATOM_COUNT)
+                .map(|i| {
+                    c.conn()
+                        .intern_atom(false, format!("_XIM_DATA_{}", i).as_bytes())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for cookie in cookies {
+                self.slots.push(cookie.reply()?.atom);
+            }
+        }
+        // Names are taken in order, so the next one is the oldest outstanding
+        // packet. Only this client writes it; the receiver can only delete it.
+        let prop = self.slots[self.next];
+        let pending = match c
+            .conn()
+            .get_property(false, self.target, prop, AtomEnum::ANY, 0, 0)?
+            .reply()
+        {
+            Ok(reply) => reply.type_ != x11rb::NONE,
+            Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Window => {
+                return Err(ClientError::NoXimServer)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if pending {
+            return Ok(false);
+        }
+        self.next = (self.next + 1) % PROPERTY_ATOM_COUNT;
+        send_property::<_, ClientError>(c, atoms, self.target, prop, packet)?;
+        Ok(true)
+    }
+}
 
 // APPEND may place several outstanding packets in one property. Consume only
 // the packet named by this ClientMessage, preserving ordering with inline CMs.
@@ -741,78 +867,103 @@ fn read_xim_property<C: HasConnection>(
     Ok(Some(reply.value))
 }
 
+fn log_req(req: &Request) {
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!("->: {:?}", req);
+    } else {
+        log::debug!("->: {}", req.name());
+    }
+}
+
+// The server keeps its original one-name-per-packet allocation: clients read
+// each property from offset zero, and the server sends rarely enough that the
+// names stay far below the client's per-keystroke rate.
+#[cfg(feature = "x11rb-server")]
 fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
     c: &C,
     atoms: &Atoms<Atom>,
     target: Window,
     buf: &mut Vec<u8>,
     sequence: &mut u16,
-    property_atoms: PropertyAtoms,
     transport_max: usize,
     req: &Request,
 ) -> Result<(), E> {
-    if log::log_enabled!(log::Level::Trace) {
-        log::trace!("->: {:?}", req);
-    } else {
-        log::debug!("->: {}", req.name());
-    }
+    log_req(req);
     buf.resize(req.size(), 0);
     xim_parser::write(req, buf);
 
     if buf.len() < transport_max {
-        if buf.len() > 20 {
-            todo!("multi-CM");
-        }
-        buf.resize(20, 0);
-        let buf: [u8; 20] = buf.as_slice().try_into().unwrap();
-        c.conn().send_event(
-            false,
-            target,
-            EventMask::NO_EVENT,
-            ClientMessageEvent {
-                response_type: CLIENT_MESSAGE_EVENT,
-                data: buf.into(),
-                format: 8,
-                sequence: 0,
-                type_: atoms.XIM_PROTOCOL,
-                window: target,
-            },
-        )?;
+        send_inline::<_, E>(c, atoms, target, buf)?;
     } else {
         let prop = c
             .conn()
             .intern_atom(false, format!("_XIM_DATA_{}", sequence).as_bytes())?
             .reply()?
             .atom;
-        *sequence = match property_atoms {
-            PropertyAtoms::BoundedClient => (*sequence + 1) % PROPERTY_ATOM_COUNT,
-            PropertyAtoms::LegacyServer => sequence.wrapping_add(1),
-        };
-        c.conn().change_property(
-            PropMode::APPEND,
-            target,
-            prop,
-            AtomEnum::STRING,
-            8,
-            buf.len() as u32,
-            buf,
-        )?;
-        c.conn().send_event(
-            false,
-            target,
-            EventMask::NO_EVENT,
-            ClientMessageEvent {
-                data: [buf.len() as u32, prop, 0, 0, 0].into(),
-                format: 32,
-                sequence: 0,
-                response_type: CLIENT_MESSAGE_EVENT,
-                type_: atoms.XIM_PROTOCOL,
-                window: target,
-            },
-        )?;
+        *sequence = sequence.wrapping_add(1);
+        send_property::<_, E>(c, atoms, target, prop, buf)?;
     }
     buf.clear();
     c.conn().flush()?;
+    Ok(())
+}
+
+fn send_inline<C: HasConnection, E: From<ConnectionError>>(
+    c: &C,
+    atoms: &Atoms<Atom>,
+    target: Window,
+    packet: &[u8],
+) -> Result<(), E> {
+    if packet.len() > 20 {
+        todo!("multi-CM");
+    }
+    let mut data = [0; 20];
+    data[..packet.len()].copy_from_slice(packet);
+    c.conn().send_event(
+        false,
+        target,
+        EventMask::NO_EVENT,
+        ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            data: data.into(),
+            format: 8,
+            sequence: 0,
+            type_: atoms.XIM_PROTOCOL,
+            window: target,
+        },
+    )?;
+    Ok(())
+}
+
+fn send_property<C: HasConnection, E: From<ConnectionError>>(
+    c: &C,
+    atoms: &Atoms<Atom>,
+    target: Window,
+    prop: Atom,
+    packet: &[u8],
+) -> Result<(), E> {
+    c.conn().change_property(
+        PropMode::APPEND,
+        target,
+        prop,
+        AtomEnum::STRING,
+        8,
+        packet.len() as u32,
+        packet,
+    )?;
+    c.conn().send_event(
+        false,
+        target,
+        EventMask::NO_EVENT,
+        ClientMessageEvent {
+            data: [packet.len() as u32, prop, 0, 0, 0].into(),
+            format: 32,
+            sequence: 0,
+            response_type: CLIENT_MESSAGE_EVENT,
+            type_: atoms.XIM_PROTOCOL,
+            window: target,
+        },
+    )?;
     Ok(())
 }
 
@@ -835,7 +986,7 @@ fn deserialize_event_impl(xev: &xim_parser::XEvent) -> KeyPressEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "x11rb-client"))]
 mod property_transport_tests {
     use super::*;
     use std::collections::HashSet;
@@ -899,89 +1050,175 @@ mod property_transport_tests {
         id
     }
 
+    // The receive path of the original revision (16f35a2, X11rbServer and
+    // X11rbClient::handle_xim_protocol): read from offset zero, delete the
+    // whole property, parse one request.
+    fn legacy_read(conn: &RustConnection, msg: &ClientMessageEvent) -> Vec<u8> {
+        let [length, atom, ..] = msg.data.as_data32();
+        conn.get_property(true, msg.window, atom, AtomEnum::ANY, 0, length)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .value
+    }
+
+    fn packet(round: usize, i: usize) -> Vec<u8> {
+        // SetIcFocus fits in a ClientMessage; Open goes through a property.
+        let req = if i % 5 == 0 {
+            Request::SetIcFocus {
+                input_method_id: round as u16,
+                input_context_id: i as u16,
+            }
+        } else {
+            Request::Open {
+                locale: format!("中文输入保持完整-{}-{}-{}", round, i, "x".repeat(i % 31)),
+            }
+        };
+        let mut bytes = alloc::vec![0; req.size()];
+        xim_parser::write(&req, &mut bytes);
+        bytes
+    }
+
+    struct NoopHandler;
+    impl<C: crate::Client> ClientHandler<C> for NoopHandler {}
+
+    fn client_message(window: Window, type_: Atom, data: [u32; 5]) -> ClientMessageEvent {
+        ClientMessageEvent::new(32, window, type_, data)
+    }
+
+    // Drives the real X11rbClient (filter_event, PropertyNotify, DisconnectReply)
+    // against a server that reads every property the way 16f35a2 does.
     #[test]
-    fn bounded_atoms_preserve_queued_packets_and_inline_order() {
+    fn client_interoperates_with_unchanged_receiver_across_reconnects() {
         let (_display, address) = private_display();
-        let (receiver, screen) = x11rb::connect(Some(&address)).unwrap();
-        let windows = [window(&receiver, screen), window(&receiver, screen)];
-        let mut offsets = PropertyOffsets::with_hasher(Default::default());
-        let mut all_atoms = HashSet::new();
-        // Reconnect the sender and reuse the same names/windows. Each round
-        // queues far more than the pool size before the receiver reads anything.
-        for round in 0..3 {
-            let (sender, _) = x11rb::connect(Some(&address)).unwrap();
-            let atoms = Atoms::new::<ReplyError, _>(|name| {
-                Ok(sender.intern_atom(false, name.as_bytes())?.reply()?.atom)
+        let (server, screen) = x11rb::connect(Some(&address)).unwrap();
+        let (conn, _) = x11rb::connect(Some(&address)).unwrap();
+        let atoms = Atoms::new::<ReplyError, _>(|name| {
+            Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+        })
+        .unwrap();
+        let mut client = X11rbClient {
+            has_conn: &conn,
+            server_owner_window: x11rb::NONE,
+            im_window: x11rb::NONE,
+            server_atom: x11rb::NONE,
+            atoms: Atoms::new::<ReplyError, _>(|name| {
+                Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
             })
-            .unwrap();
-            let mut sequence = 0;
-            let mut buf = Vec::new();
-            let mut expected = Vec::new();
-            for i in 0..2048 {
-                let req = Request::Open {
-                    locale: if i % 7 == 0 {
-                        "en".into()
-                    } else {
-                        format!("中文输入保持完整-{}-{}-{}", round, i, "x".repeat(i % 31))
-                    },
-                };
-                let mut bytes = alloc::vec![0; req.size()];
-                xim_parser::write(&req, &mut bytes);
-                let target = windows[i % windows.len()];
-                send_req_impl::<_, ReplyError>(
-                    &sender,
-                    &atoms,
-                    target,
-                    &mut buf,
-                    &mut sequence,
-                    PropertyAtoms::BoundedClient,
-                    20,
-                    &req,
+            .unwrap(),
+            transport_max: 20,
+            client_window: window(&conn, screen),
+            im_attributes: AHashMap::with_hasher(Default::default()),
+            ic_attributes: AHashMap::with_hasher(Default::default()),
+            transport: PropertyTransport::new(),
+            property_offsets: PropertyOffsets::with_hasher(Default::default()),
+        };
+        let pump = |client: &mut X11rbClient<&RustConnection>| {
+            conn.get_input_focus().unwrap().reply().unwrap();
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                client.filter_event(&event, &mut NoopHandler).unwrap();
+            }
+        };
+        let mut all_atoms = HashSet::new();
+        for round in 0..3 {
+            // A new server window per connection, as XIM servers do.
+            let im_window = window(&server, screen);
+            server
+                .send_event(
+                    false,
+                    client.client_window,
+                    EventMask::NO_EVENT,
+                    client_message(
+                        client.client_window,
+                        atoms.XIM_XCONNECT,
+                        [im_window, 0, 2, 20, 0],
+                    ),
                 )
                 .unwrap();
-                expected.push((target, bytes));
+            server.flush().unwrap();
+            pump(&mut client);
+            assert_eq!(client.im_window, im_window);
+
+            let mut expected = alloc::vec![xim_parser::write_to_vec(Request::Connect {
+                client_major_protocol_version: 1,
+                client_minor_protocol_version: 0,
+                endian: xim_parser::Endian::Native,
+                client_auth_protocol_names: Vec::new(),
+            })];
+            for i in 0..300 {
+                let bytes = packet(round, i);
+                client.send_req(xim_parser::read(&bytes).unwrap()).unwrap();
+                expected.push(bytes);
             }
-            // Server-side barrier: every append/event has been processed before
-            // we drain, so the test cannot accidentally avoid pool collisions.
-            sender.get_input_focus().unwrap().reply().unwrap();
-            for (target, bytes) in expected {
-                let msg = loop {
-                    if let Event::ClientMessage(msg) = receiver.wait_for_event().unwrap() {
-                        break msg;
+            conn.get_input_focus().unwrap().reply().unwrap();
+            assert!(client.transport.queue.len() > PROPERTY_ATOM_COUNT);
+
+            let mut expected = expected.into_iter().peekable();
+            while let Some(bytes) = expected.peek() {
+                let msg = match server.poll_for_event().unwrap() {
+                    Some(Event::ClientMessage(msg)) => msg,
+                    Some(_) => continue,
+                    None => {
+                        pump(&mut client);
+                        continue;
                     }
                 };
-                assert_eq!(msg.window, target);
+                assert_eq!(msg.window, im_window);
                 let actual = if msg.format == 32 {
                     all_atoms.insert(msg.data.as_data32()[1]);
-                    read_xim_property(&receiver, &mut offsets, &msg)
-                        .unwrap()
-                        .unwrap()
+                    legacy_read(&server, &msg)
                 } else {
                     msg.data.as_data8()[..bytes.len()].to_vec()
                 };
                 assert_eq!(
-                    actual, bytes,
-                    "queued XIM packet changed or arrived out of order"
+                    &actual, bytes,
+                    "queued XIM packet changed, lost or arrived out of order"
                 );
-                xim_parser::read::<Request>(&actual).unwrap();
+                expected.next();
             }
-            assert!(
-                offsets.is_empty(),
-                "fully drained properties must reset offsets"
-            );
-            assert!(all_atoms.len() <= PROPERTY_ATOM_COUNT as usize);
-            for target in windows {
-                for atom in &all_atoms {
-                    let reply = receiver
-                        .get_property(false, target, *atom, AtomEnum::ANY, 0, 1)
-                        .unwrap()
-                        .reply()
-                        .unwrap();
-                    assert_eq!(reply.type_, x11rb::NONE, "drained property was not deleted");
-                }
-            }
+            assert!(client.transport.queue.is_empty());
+
+            // Disconnect, then reconnect in the next round.
+            let mut reply = [0; 20];
+            xim_parser::write(Request::DisconnectReply {}, &mut reply);
+            server
+                .send_event(
+                    false,
+                    client.client_window,
+                    EventMask::NO_EVENT,
+                    ClientMessageEvent::new(8, client.client_window, atoms.XIM_PROTOCOL, reply),
+                )
+                .unwrap();
+            server.flush().unwrap();
+            pump(&mut client);
+            assert_eq!(client.transport.target, x11rb::NONE);
         }
-        assert_eq!(all_atoms.len(), PROPERTY_ATOM_COUNT as usize);
+        assert_eq!(all_atoms.len(), PROPERTY_ATOM_COUNT);
+    }
+
+    #[test]
+    fn stalled_receiver_gets_bounded_queue() {
+        let (_display, address) = private_display();
+        let (receiver, screen) = x11rb::connect(Some(&address)).unwrap();
+        let target = window(&receiver, screen);
+        let atoms = Atoms::new::<ReplyError, _>(|name| {
+            Ok(receiver.intern_atom(false, name.as_bytes())?.reply()?.atom)
+        })
+        .unwrap();
+        let mut transport = PropertyTransport::new();
+        transport.connect(&receiver, target).unwrap();
+        let long = packet(0, 1);
+        for _ in 0..PROPERTY_ATOM_COUNT + MAX_QUEUED_PACKETS {
+            transport.send(&receiver, &atoms, 20, long.clone()).unwrap();
+        }
+        assert_eq!(transport.queue.len(), MAX_QUEUED_PACKETS);
+        assert!(matches!(
+            transport.send(&receiver, &atoms, 20, long.clone()),
+            Err(ClientError::TransportBusy)
+        ));
+        // A disconnect drops packets addressed to the old server window.
+        transport.disconnect();
+        assert!(transport.queue.is_empty());
     }
 
     #[test]
